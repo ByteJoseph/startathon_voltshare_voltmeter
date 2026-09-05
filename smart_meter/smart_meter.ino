@@ -1,4 +1,28 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
 #define ACS712_PIN 34
+
+String httpGET(const String& url) {
+    HTTPClient http;
+
+    http.begin(url);
+
+    int httpCode = http.GET();
+
+    if (httpCode > 0) {
+        String response = http.getString();
+        http.end();
+        return response;
+    }
+
+    Serial.printf("HTTP GET failed: %s\n", http.errorToString(httpCode).c_str());
+
+    http.end();
+    return "";
+}
+
+String response;
 
 // ACS712 5A sensitivity
 const float SENSITIVITY = 0.185;  // 185 mV/A
@@ -55,6 +79,12 @@ void loop() {
   // Remove small noise around zero
   if (current > -0.10 && current < 0.10) {
     current = 0;
+  }
+  if (current == 0){
+    response = httpGET("https://startathon-voltshare-smartmeter.onrender.com/button/status?off=true");
+  }
+  else {
+    response = httpGET("https://startathon-voltshare-smartmeter.onrender.com/button/status?on=true");
   }
   current = -1*current;
   Serial.print("Current = ");
