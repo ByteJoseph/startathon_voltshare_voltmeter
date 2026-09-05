@@ -2,15 +2,15 @@
  * meterMetrics.js — Meter Metrics Routes
  *
  * POST /meter-metrics/producer   — store a metric snapshot in memory (no response body)
- * GET  /meter-metrics/producer   — retrieve and auto-clear the stored snapshot (or all zeros if none)
+ * GET  /meter-metrics/producer   — retrieve the latest stored snapshot (or all zeros if none)
  * POST /meter-metrics/consumer   — store a metric snapshot in memory (no response body)
- * GET  /meter-metrics/consumer   — retrieve and auto-clear the stored snapshot (or all zeros if none)
+ * GET  /meter-metrics/consumer   — retrieve the latest stored snapshot (or all zeros if none)
  *
  * Design:
  *   • POST stores the submitted values in a module-level variable (one slot per meter type).
  *     It returns 204 No Content — the value is NOT echoed back.
- *   • GET retrieves the stored value and then clears it (one-shot read). Returns all-zero
- *     metrics if nothing has been posted yet, or the slot was already consumed.
+ *   • GET retrieves the stored value WITHOUT clearing it, so dashboards can poll repeatedly.
+ *     Returns all-zero metrics if nothing has been posted yet.
  *   • Each slot holds only the most recent POST; a second POST overwrites the previous one.
  */
 
@@ -81,25 +81,21 @@ router.post('/consumer', (req, res) => {
 /**
  * GET /meter-metrics/producer
  *
- * Retrieves the stored producer snapshot and then auto-clears it (one-shot read).
- * Returns all-zero metrics if nothing has been posted yet or the slot was already consumed.
+ * Retrieves the latest stored producer snapshot (does NOT clear it).
+ * Returns all-zero metrics if nothing has been posted yet.
  */
 router.get('/producer', (req, res) => {
-  const snapshot = producerSnapshot;
-  producerSnapshot = null; // auto-remove after serving
-  res.json(snapshot || buildProducerMetrics());
+  res.json(producerSnapshot || buildProducerMetrics());
 });
 
 /**
  * GET /meter-metrics/consumer
  *
- * Retrieves the stored consumer snapshot and then auto-clears it (one-shot read).
- * Returns all-zero metrics if nothing has been posted yet or the slot was already consumed.
+ * Retrieves the latest stored consumer snapshot (does NOT clear it).
+ * Returns all-zero metrics if nothing has been posted yet.
  */
 router.get('/consumer', (req, res) => {
-  const snapshot = consumerSnapshot;
-  consumerSnapshot = null; // auto-remove after serving
-  res.json(snapshot || buildConsumerMetrics());
+  res.json(consumerSnapshot || buildConsumerMetrics());
 });
 
 module.exports = router;

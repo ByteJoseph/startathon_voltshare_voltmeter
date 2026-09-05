@@ -4,136 +4,104 @@
 #include <ArduinoJson.h>
 #include <math.h>
 
-// =====================================================
+// =========================
 // PIN CONFIGURATION
-// =====================================================
-
+// =========================
 #define ACS712_PIN 34
 #define RELAY_PIN 32
 
-
-// =====================================================
-// WIFI / SERVER CONFIGURATION
-// =====================================================
-
+// =========================
+// WIFI
+// =========================
 const char* WIFI_SSID = "Oppo";
 const char* WIFI_PASSWORD = "7356125156";
 
+// =========================
+// API URLS
+// =========================
 const char* PURCHASE_URL =
   "https://startathon-voltshare-smartmeter.onrender.com/consumer-purchase";
 
-const char* METRICS_URL =
+const char* PRODUCER_METRICS_URL =
+  "https://startathon-voltshare-smartmeter.onrender.com/meter-metrics/producer";
+
+const char* CONSUMER_METRICS_URL =
   "https://startathon-voltshare-smartmeter.onrender.com/meter-metrics/consumer";
 
-
-// =====================================================
+// =========================
 // ACS712 CONFIGURATION
-// =====================================================
-
+// =========================
+// ACS712-5A = 0.185 V/A
 const float SENSITIVITY = 0.185;
+
 const float ADC_REFERENCE = 3.3;
 const float ADC_MAX = 4095.0;
+
+// Ignore tiny sensor noise
 const float CURRENT_NOISE_THRESHOLD = 0.10;
 
+// =========================
+// ELECTRICAL VALUES
+// =========================
+const float SUPPLY_VOLTAGE = 9.0;
+const float POWER_FACTOR = 1.0;
 
-// =====================================================
-// PRODUCER METRIC CONFIGURATION
-// =====================================================
-
-// Actual voltage to report
-const float PRODUCER_VOLTAGE = 5.0;
-
-// Power factor to report
-const float POWER_FACTOR = 0.95;
-
-// Accumulated producer energy in kWh
-float producerEnergyKWh = 0.0;
-
-
-// =====================================================
-// TIMING CONFIGURATION
-// =====================================================
-
+// =========================
+// ADC SAMPLING
+// =========================
 const int ADC_SAMPLES = 200;
 const int ADC_SAMPLE_DELAY_US = 100;
 
-const unsigned long PURCHASE_INTERVAL = 1000;
-const unsigned long RELAY_DURATION = 2000;
+// =========================
+// TIMING
+// =========================
+const unsigned long PURCHASE_INTERVAL = 1000;  // 1 second
+const unsigned long METRICS_INTERVAL = 500;    // 500 ms
+const unsigned long RELAY_DURATION = 2000;     // 2 seconds
 
-const unsigned long METRICS_INTERVAL = 1000;
+const int LOOP_DELAY_MS = 50;
 
-
-// =====================================================
-// TASK CONFIGURATION
-// =====================================================
-
-const int SENSOR_TASK_DELAY_MS = 50;
-const int NETWORK_TASK_DELAY_MS = 20;
-const int RELAY_TASK_DELAY_MS = 10;
-
-
-// =====================================================
+// =========================
 // GLOBAL VARIABLES
-// =====================================================
-
+// =========================
 float zeroVoltage = 0.0;
 
+float measuredCurrent = 0.0;
+float measuredVoltage = SUPPLY_VOLTAGE;
+float measuredPower = 0.0;
+float apparentPower = 0.0;
 
-// =====================================================
-// SHARED STATE
-// =====================================================
+// Energy stored in Wh
+double totalEnergyWh = 0.0;
+
+unsigned long lastEnergyTime = 0;
+unsigned long lastPurchaseCheck = 0;
+unsigned long lastMetricsSend = 0;
 
 bool currentIsOn = false;
 
-bool relayTrigger = false;
 bool relayActive = false;
-
 unsigned long relayStartTime = 0;
 
-// Latest current measured by sensor task
-float latestCurrent = 0.0;
-
 
 // =====================================================
-// MUTEX
+// CONNECT TO WIFI
 // =====================================================
-
-SemaphoreHandle_t stateMutex;
-
-
-// =====================================================
-// TIMERS
-// =====================================================
-
-unsigned long lastPurchaseCheck = 0;
-unsigned long lastMetricsPost = 0;
-unsigned long lastEnergyUpdate = 0;
-
-
-// =====================================================
-// WIFI CONNECTION
-// =====================================================
-
 void connectWiFi() {
 
   Serial.println();
-  Serial.println("==============================");
-  Serial.println("Starting WiFi connection...");
+  Serial.println("Connecting to WiFi...");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("Connecting to WiFi");
+  unsigned long startAttempt = millis();
 
-  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttempt < 15000) {
 
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-
-    vTaskDelay(pdMS_TO_TICKS(250));
-
+    delay(500);
     Serial.print(".");
-
-    attempts++;
   }
 
   Serial.println();
@@ -145,694 +113,565 @@ void connectWiFi() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
 
-    Serial.print("Signal strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-
   } else {
 
-    Serial.println("WiFi connection FAILED!");
+    Serial.println("WiFi connection failed.");
   }
-
-  Serial.println("==============================");
 }
 
 
 // =====================================================
-// ENSURE WIFI CONNECTION
+// ENSURE WIFI IS CONNECTED
 // =====================================================
-
-bool ensureWiFi() {
+void ensureWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
-    return true;
+    return;
   }
 
-  Serial.println();
-  Serial.println("WiFi disconnected.");
-  Serial.println("Reconnecting...");
+  Serial.println("WiFi disconnected. Reconnecting...");
 
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  unsigned long startTime = millis();
+  unsigned long startAttempt = millis();
 
   while (WiFi.status() != WL_CONNECTED &&
-         millis() - startTime < 5000) {
+         millis() - startAttempt < 10000) {
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    delay(500);
+    Serial.print(".");
   }
+
+  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
 
-    Serial.println("WiFi reconnected!");
+    Serial.println("WiFi reconnected.");
 
-    return true;
+  } else {
+
+    Serial.println("WiFi reconnect failed.");
+  }
+}
+
+
+// =====================================================
+// CALIBRATE ACS712 ZERO CURRENT
+// =====================================================
+void calibrateCurrentSensor() {
+
+  Serial.println();
+  Serial.println("Calibrating ACS712...");
+  Serial.println("Make sure NO current is flowing.");
+
+  delay(2000);
+
+  long totalADC = 0;
+
+  const int calibrationSamples = 1000;
+
+  for (int i = 0; i < calibrationSamples; i++) {
+
+    totalADC += analogRead(ACS712_PIN);
+
+    delayMicroseconds(100);
   }
 
-  Serial.println("WiFi reconnect failed.");
+  float averageADC =
+    (float)totalADC / calibrationSamples;
 
-  return false;
+  zeroVoltage =
+    (averageADC / ADC_MAX) * ADC_REFERENCE;
+
+  Serial.print("Zero ADC: ");
+  Serial.println(averageADC, 2);
+
+  Serial.print("Zero voltage: ");
+  Serial.print(zeroVoltage, 6);
+  Serial.println(" V");
+
+  Serial.println("Calibration complete.");
+}
+
+
+// =====================================================
+// READ CURRENT AND CALCULATE POWER + ENERGY
+// =====================================================
+void readCurrent() {
+
+  long adcSum = 0;
+
+  // Take multiple ADC samples
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+
+    adcSum += analogRead(ACS712_PIN);
+
+    delayMicroseconds(ADC_SAMPLE_DELAY_US);
+  }
+
+  float averageADC =
+    (float)adcSum / ADC_SAMPLES;
+
+  float sensorVoltage =
+    (averageADC / ADC_MAX) * ADC_REFERENCE;
+
+  // Calculate current
+  float current =
+    (sensorVoltage - zeroVoltage) / SENSITIVITY;
+
+  // Remove tiny sensor noise
+  if (fabs(current) <= CURRENT_NOISE_THRESHOLD) {
+
+    current = 0.0;
+  }
+
+  // Keep current positive
+  current = fabs(current);
+
+  measuredCurrent = current;
+
+  // Fixed supply voltage
+  measuredVoltage = SUPPLY_VOLTAGE;
+
+
+  // =========================
+  // POWER CALCULATION
+  // =========================
+  if (measuredCurrent > CURRENT_NOISE_THRESHOLD) {
+
+    measuredPower =
+      measuredVoltage *
+      measuredCurrent *
+      POWER_FACTOR;
+
+    apparentPower =
+      measuredVoltage *
+      measuredCurrent;
+
+  } else {
+
+    // No current = no power
+    measuredPower = 0.0;
+    apparentPower = 0.0;
+  }
+
+
+  // =========================
+  // ENERGY CALCULATION
+  // =========================
+  unsigned long now = millis();
+
+  if (lastEnergyTime == 0) {
+
+    lastEnergyTime = now;
+
+  } else {
+
+    unsigned long elapsedMilliseconds =
+      now - lastEnergyTime;
+
+    double elapsedHours =
+      elapsedMilliseconds / 3600000.0;
+
+    // Only accumulate real energy
+    if (measuredCurrent > CURRENT_NOISE_THRESHOLD) {
+
+      // Wh = W × hours
+      totalEnergyWh +=
+        measuredPower * elapsedHours;
+    }
+
+    lastEnergyTime = now;
+  }
+
+
+  currentIsOn =
+    measuredCurrent > CURRENT_NOISE_THRESHOLD;
+
+
+  // =========================
+  // SERIAL OUTPUT
+  // =========================
+  Serial.println();
+  Serial.println("========== METER ==========");
+
+  Serial.print("ADC: ");
+  Serial.println(averageADC, 2);
+
+  Serial.print("Sensor Voltage: ");
+  Serial.print(sensorVoltage, 6);
+  Serial.println(" V");
+
+  Serial.print("Supply Voltage: ");
+  Serial.print(measuredVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Current: ");
+  Serial.print(measuredCurrent, 4);
+  Serial.println(" A");
+
+  Serial.print("Power Factor: ");
+  Serial.println(POWER_FACTOR, 2);
+
+  Serial.print("Real Power: ");
+  Serial.print(measuredPower, 4);
+  Serial.println(" W");
+
+  Serial.print("Apparent Power: ");
+  Serial.print(apparentPower, 4);
+  Serial.println(" VA");
+
+  Serial.print("Energy: ");
+  Serial.print(totalEnergyWh, 12);
+  Serial.println(" Wh");
+
+  Serial.print("Current Status: ");
+
+  if (currentIsOn) {
+
+    Serial.println("ON");
+
+  } else {
+
+    Serial.println("OFF");
+  }
+
+  Serial.println("============================");
 }
 
 
 // =====================================================
 // CHECK CONSUMER PURCHASE
 // =====================================================
-
 void checkConsumerPurchase() {
 
-  if (!ensureWiFi()) {
+  ensureWiFi();
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    Serial.println(
+      "Skipping purchase check: WiFi unavailable."
+    );
+
     return;
   }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
 
   Serial.println();
   Serial.println("Checking consumer purchase...");
 
-  WiFiClientSecure client;
+  if (!https.begin(client, PURCHASE_URL)) {
 
-  client.setInsecure();
-
-  HTTPClient http;
-
-  if (!http.begin(client, PURCHASE_URL)) {
-
-    Serial.println("Failed to start purchase request.");
+    Serial.println(
+      "Unable to begin purchase request."
+    );
 
     return;
   }
 
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
+  https.setTimeout(3000);
 
-  int httpCode = http.GET();
+  int httpCode = https.GET();
 
   Serial.print("Purchase response code: ");
   Serial.println(httpCode);
 
 
-  // ===================================================
-  // NO PURCHASE
-  // ===================================================
+  if (httpCode == HTTP_CODE_OK) {
 
-  if (httpCode == 404) {
+    String payload = https.getString();
 
-    Serial.println("No consumer purchase found.");
+    Serial.print("Purchase response: ");
+    Serial.println(payload);
 
-    http.end();
+    DynamicJsonDocument doc(1024);
 
-    return;
-  }
+    DeserializationError error =
+      deserializeJson(doc, payload);
 
+    if (!error) {
 
-  // ===================================================
-  // SERVER ERROR
-  // ===================================================
+      if (doc.containsKey("kwh")) {
 
-  if (httpCode <= 0) {
+        float purchasedKWh =
+          doc["kwh"].as<float>();
 
-    Serial.print("Purchase request failed: ");
-    Serial.println(http.errorToString(httpCode));
+        Serial.print("Purchased energy: ");
+        Serial.print(purchasedKWh, 6);
+        Serial.println(" kWh");
 
-    http.end();
 
-    return;
-  }
-
-
-  // ===================================================
-  // GET JSON
-  // ===================================================
-
-  String jsonResponse = http.getString();
-
-  http.end();
-
-  Serial.print("Purchase JSON: ");
-  Serial.println(jsonResponse);
-
-
-  // ===================================================
-  // PARSE JSON
-  // ===================================================
-
-  JsonDocument doc;
-
-  DeserializationError error =
-    deserializeJson(doc, jsonResponse);
-
-  if (error) {
-
-    Serial.print("JSON parsing failed: ");
-    Serial.println(error.c_str());
-
-    return;
-  }
-
-
-  // ===================================================
-  // GET KWH
-  // ===================================================
-
-  if (!doc["kwh"].is<float>() &&
-      !doc["kwh"].is<int>() &&
-      !doc["kwh"].is<double>()) {
-
-    Serial.println("JSON does not contain valid kwh.");
-
-    return;
-  }
-
-  float kwh = doc["kwh"].as<float>();
-
-  Serial.print("KWH received: ");
-  Serial.println(kwh, 4);
-
-
-  // ===================================================
-  // REQUEST RELAY
-  // ===================================================
-
-  Serial.println("================================");
-  Serial.println("PURCHASE DETECTED!");
-  Serial.println("Requesting Relay ON");
-  Serial.println("================================");
-
-
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-
-    relayTrigger = true;
-
-    xSemaphoreGive(stateMutex);
-  }
-}
-
-
-// =====================================================
-// READ CURRENT
-// =====================================================
-
-float readCurrent() {
-
-  long total = 0;
-
-  for (int i = 0; i < ADC_SAMPLES; i++) {
-
-    total += analogRead(ACS712_PIN);
-
-    delayMicroseconds(ADC_SAMPLE_DELAY_US);
-  }
-
-
-  float averageADC =
-    total / (float)ADC_SAMPLES;
-
-
-  float voltage =
-    (averageADC / ADC_MAX) * ADC_REFERENCE;
-
-
-  float current =
-    (voltage - zeroVoltage) / SENSITIVITY;
-
-
-  // Remove noise
-  if (current > -CURRENT_NOISE_THRESHOLD &&
-      current < CURRENT_NOISE_THRESHOLD) {
-
-    current = 0;
-  }
-
-
-  // Original sign reversal
-  current = -current;
-
-
-  Serial.println();
-  Serial.println("------------------------------");
-
-  Serial.print("ADC = ");
-  Serial.println(averageADC);
-
-  Serial.print("ACS712 Output Voltage = ");
-  Serial.print(voltage, 4);
-  Serial.println(" V");
-
-  Serial.print("Current = ");
-  Serial.print(current, 3);
-  Serial.println(" A");
-
-  Serial.println("------------------------------");
-
-
-  return current;
-}
-
-
-// =====================================================
-// POST PRODUCER METRICS
-// =====================================================
-
-void postProducerMetrics(float current) {
-
-  if (!ensureWiFi()) {
-    return;
-  }
-
-
-  // ===================================================
-  // CALCULATE POWER
-  // ===================================================
-
-  float power =
-    PRODUCER_VOLTAGE *
-    fabs(current) *
-    POWER_FACTOR;
-
-
-  // ===================================================
-  // CALCULATE ENERGY
-  // ===================================================
-
-  unsigned long now = millis();
-
-  if (lastEnergyUpdate == 0) {
-
-    lastEnergyUpdate = now;
-  }
-
-  float elapsedHours =
-    (now - lastEnergyUpdate) / 3600000.0;
-
-  // Power is in watts.
-  // Convert watts to kW and multiply by hours.
-
-  producerEnergyKWh +=
-    (power / 1000.0) * elapsedHours;
-
-  lastEnergyUpdate = now;
-
-
-  // ===================================================
-  // CREATE HTTPS CLIENT
-  // ===================================================
-
-  WiFiClientSecure client;
-
-  client.setInsecure();
-
-  HTTPClient http;
-
-
-  if (!http.begin(client, METRICS_URL)) {
-
-    Serial.println(
-      "Failed to start producer metrics request."
-    );
-
-    return;
-  }
-
-
-  // ===================================================
-  // HTTP HEADERS
-  // ===================================================
-
-  http.addHeader(
-    "Content-Type",
-    "application/json"
-  );
-
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
-
-
-  // ===================================================
-  // CREATE JSON
-  // ===================================================
-
-  JsonDocument doc;
-
-  doc["power"] = power;
-  doc["energy"] = producerEnergyKWh;
-  doc["voltage"] = PRODUCER_VOLTAGE;
-  doc["powerFactor"] = POWER_FACTOR;
-
-
-  String requestBody;
-
-  serializeJson(doc, requestBody);
-
-
-  // ===================================================
-  // DEBUG OUTPUT
-  // ===================================================
-
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println("PRODUCER METRICS");
-  Serial.println("==============================");
-
-  Serial.print("Current: ");
-  Serial.print(current, 3);
-  Serial.println(" A");
-
-  Serial.print("Power: ");
-  Serial.print(power, 2);
-  Serial.println(" W");
-
-  Serial.print("Energy: ");
-  Serial.print(producerEnergyKWh, 6);
-  Serial.println(" kWh");
-
-  Serial.print("Voltage: ");
-  Serial.print(PRODUCER_VOLTAGE, 2);
-  Serial.println(" V");
-
-  Serial.print("Power Factor: ");
-  Serial.println(POWER_FACTOR, 2);
-
-  Serial.print("POST body: ");
-  Serial.println(requestBody);
-
-
-  // ===================================================
-  // SEND POST
-  // ===================================================
-
-  int httpCode =
-    http.POST(requestBody);
-
-
-  Serial.print(
-    "Producer metrics response code: "
-  );
-
-  Serial.println(httpCode);
-
-
-  // ===================================================
-  // RESPONSE
-  // ===================================================
-
-  if (httpCode > 0) {
-
-    String response =
-      http.getString();
-
-    Serial.print(
-      "Producer metrics response: "
-    );
-
-    Serial.println(response);
-
-  } else {
-
-    Serial.print(
-      "Producer metrics POST failed: "
-    );
-
-    Serial.println(
-      http.errorToString(httpCode)
-    );
-  }
-
-
-  Serial.println("==============================");
-
-  http.end();
-}
-
-
-// =====================================================
-// SENSOR TASK
-// =====================================================
-
-void sensorTask(void* parameter) {
-
-  Serial.println("Sensor task started.");
-
-  while (true) {
-
-    float current = readCurrent();
-
-
-    // =================================================
-    // SAVE LATEST CURRENT
-    // =================================================
-
-    if (xSemaphoreTake(
-          stateMutex,
-          pdMS_TO_TICKS(10)
-        ) == pdTRUE) {
-
-      latestCurrent = current;
-
-      xSemaphoreGive(stateMutex);
-    }
-
-
-    // =================================================
-    // DETERMINE CURRENT STATE
-    // =================================================
-
-    bool newCurrentState =
-      fabs(current) >= CURRENT_NOISE_THRESHOLD;
-
-
-    // Save current state
-    if (xSemaphoreTake(
-          stateMutex,
-          pdMS_TO_TICKS(10)
-        ) == pdTRUE) {
-
-      currentIsOn = newCurrentState;
-
-      xSemaphoreGive(stateMutex);
-    }
-
-
-    if (newCurrentState) {
-
-      Serial.println("CURRENT: ON");
-
-    } else {
-
-      Serial.println("CURRENT: OFF");
-    }
-
-
-    vTaskDelay(
-      pdMS_TO_TICKS(SENSOR_TASK_DELAY_MS)
-    );
-  }
-}
-
-
-// =====================================================
-// RELAY TASK
-// =====================================================
-
-void relayTask(void* parameter) {
-
-  Serial.println("Relay task started.");
-
-  while (true) {
-
-    bool shouldTrigger = false;
-
-
-    // =================================================
-    // CHECK FOR RELAY REQUEST
-    // =================================================
-
-    if (xSemaphoreTake(
-          stateMutex,
-          pdMS_TO_TICKS(10)
-        ) == pdTRUE) {
-
-      if (relayTrigger) {
-
-        relayTrigger = false;
-
-        shouldTrigger = true;
-      }
-
-      xSemaphoreGive(stateMutex);
-    }
-
-
-    // =================================================
-    // TURN RELAY ON
-    // =================================================
-
-    if (shouldTrigger) {
-
-      digitalWrite(RELAY_PIN, HIGH);
-
-      Serial.println("Relay ON");
-
-
-      if (xSemaphoreTake(
-            stateMutex,
-            pdMS_TO_TICKS(10)
-          ) == pdTRUE) {
+        // =========================
+        // ACTIVATE RELAY
+        // =========================
+        digitalWrite(RELAY_PIN, HIGH);
 
         relayActive = true;
 
         relayStartTime = millis();
 
-        xSemaphoreGive(stateMutex);
-      }
-    }
-
-
-    // =================================================
-    // CHECK RELAY TIMER
-    // =================================================
-
-    bool shouldTurnOff = false;
-
-
-    if (xSemaphoreTake(
-          stateMutex,
-          pdMS_TO_TICKS(10)
-        ) == pdTRUE) {
-
-      if (relayActive &&
-          millis() - relayStartTime >= RELAY_DURATION) {
-
-        relayActive = false;
-
-        shouldTurnOff = true;
+        Serial.println("Relay ON.");
       }
 
-      xSemaphoreGive(stateMutex);
+    } else {
+
+      Serial.print("JSON parse error: ");
+      Serial.println(error.c_str());
     }
 
+  } else if (httpCode == HTTP_CODE_NOT_FOUND) {
 
-    // =================================================
-    // TURN RELAY OFF
-    // =================================================
+    Serial.println("No consumer purchase found.");
 
-    if (shouldTurnOff) {
+  } else {
 
-      digitalWrite(RELAY_PIN, LOW);
-
-      Serial.println("Relay OFF");
-    }
-
-
-    vTaskDelay(
-      pdMS_TO_TICKS(RELAY_TASK_DELAY_MS)
+    Serial.print("Purchase request failed: ");
+    Serial.println(
+      https.errorToString(httpCode)
     );
+  }
+
+  https.end();
+}
+
+
+// =====================================================
+// UPDATE RELAY
+// =====================================================
+void updateRelay() {
+
+  if (!relayActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - relayStartTime >= RELAY_DURATION) {
+
+    digitalWrite(RELAY_PIN, LOW);
+
+    relayActive = false;
+
+    Serial.println();
+    Serial.println("Relay OFF.");
   }
 }
 
 
 // =====================================================
-// NETWORK TASK
+// SEND METRICS TO ONE ENDPOINT
 // =====================================================
+void sendMetricsToEndpoint(
+  const char* endpoint,
+  const char* endpointName
+) {
 
-void networkTask(void* parameter) {
+  ensureWiFi();
 
-  Serial.println("Network task started.");
+  if (WiFi.status() != WL_CONNECTED) {
 
-  // Allow immediate first purchase check
-  lastPurchaseCheck =
-    millis() - PURCHASE_INTERVAL;
+    Serial.print("Skipping ");
+    Serial.print(endpointName);
+    Serial.println(" metrics: WiFi unavailable.");
 
-  // Allow immediate first metrics POST
-  lastMetricsPost =
-    millis() - METRICS_INTERVAL;
-
-  lastEnergyUpdate = millis();
-
-
-  while (true) {
-
-    unsigned long now = millis();
+    return;
+  }
 
 
-    // =================================================
-    // CHECK PURCHASE
-    // =================================================
+  WiFiClientSecure client;
+  client.setInsecure();
 
-    if (now - lastPurchaseCheck >=
-        PURCHASE_INTERVAL) {
+  HTTPClient https;
 
-      lastPurchaseCheck = now;
+  Serial.println();
+  Serial.print("Sending metrics to ");
+  Serial.println(endpointName);
 
-      checkConsumerPurchase();
+
+  if (!https.begin(client, endpoint)) {
+
+    Serial.print(
+      "Unable to begin "
+    );
+
+    Serial.print(endpointName);
+    Serial.println(" metrics request.");
+
+    return;
+  }
+
+  https.setTimeout(3000);
+
+  https.addHeader(
+    "Content-Type",
+    "application/json"
+  );
+
+
+  // =========================
+  // CREATE JSON
+  // =========================
+  DynamicJsonDocument doc(512);
+
+  // Real measured power
+  doc["power"] = measuredPower;
+
+  // Real accumulated energy in Wh
+  doc["energy"] = totalEnergyWh;
+
+  // Supply voltage
+  doc["voltage"] = measuredVoltage;
+
+  // Power factor
+  doc["powerFactor"] = POWER_FACTOR;
+
+
+  String jsonPayload;
+
+  serializeJson(
+    doc,
+    jsonPayload
+  );
+
+
+  Serial.print("POST body: ");
+  Serial.println(jsonPayload);
+
+
+  // =========================
+  // POST
+  // =========================
+  int httpCode =
+    https.POST(jsonPayload);
+
+
+  Serial.print(
+    endpointName
+  );
+
+  Serial.print(
+    " response code: "
+  );
+
+  Serial.println(httpCode);
+
+
+  // =========================
+  // RESPONSE HANDLING
+  // =========================
+  if (httpCode > 0) {
+
+    if (httpCode == 200 ||
+        httpCode == 201 ||
+        httpCode == 202 ||
+        httpCode == 204) {
+
+      Serial.print(
+        endpointName
+      );
+
+      Serial.println(
+        " metrics sent successfully."
+      );
+
+    } else {
+
+      String response =
+        https.getString();
+
+      Serial.print(
+        endpointName
+      );
+
+      Serial.print(
+        " server response: "
+      );
+
+      Serial.println(response);
     }
 
+  } else {
 
-    // =================================================
-    // POST PRODUCER METRICS
-    // =================================================
+    Serial.print(
+      endpointName
+    );
 
-    if (now - lastMetricsPost >=
-        METRICS_INTERVAL) {
+    Serial.print(
+      " POST failed: "
+    );
 
-      lastMetricsPost = now;
-
-
-      float current = 0.0;
-
-
-      // Get latest sensor value
-      if (xSemaphoreTake(
-            stateMutex,
-            pdMS_TO_TICKS(10)
-          ) == pdTRUE) {
-
-        current = latestCurrent;
-
-        xSemaphoreGive(stateMutex);
-      }
-
-
-      postProducerMetrics(current);
-    }
-
-
-    // =================================================
-    // GIVE CPU TO OTHER TASKS
-    // =================================================
-
-    vTaskDelay(
-      pdMS_TO_TICKS(NETWORK_TASK_DELAY_MS)
+    Serial.println(
+      https.errorToString(httpCode)
     );
   }
+
+
+  https.end();
+}
+
+
+// =====================================================
+// SEND METRICS TO BOTH PRODUCER AND CONSUMER
+// =====================================================
+void sendMeterMetrics() {
+
+  // =========================
+  // PRODUCER
+  // =========================
+  sendMetricsToEndpoint(
+    PRODUCER_METRICS_URL,
+    "PRODUCER"
+  );
+
+
+  // =========================
+  // CONSUMER
+  // =========================
+  sendMetricsToEndpoint(
+    CONSUMER_METRICS_URL,
+    "CONSUMER"
+  );
 }
 
 
 // =====================================================
 // SETUP
 // =====================================================
-
 void setup() {
 
   Serial.begin(115200);
 
-  pinMode(RELAY_PIN, OUTPUT);
+  delay(1000);
 
-  digitalWrite(RELAY_PIN, LOW);
-
-  delay(500);
-
-
-  // ===================================================
-  // WIFI
-  // ===================================================
-
-  connectWiFi();
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("       ESP32 SMART METER");
+  Serial.println("================================");
 
 
-  // ===================================================
-  // ADC CONFIGURATION
-  // ===================================================
+  // =========================
+  // RELAY
+  // =========================
+  pinMode(
+    RELAY_PIN,
+    OUTPUT
+  );
 
+  // Start relay OFF
+  digitalWrite(
+    RELAY_PIN,
+    LOW
+  );
+
+
+  // =========================
+  // ADC
+  // =========================
   analogReadResolution(12);
 
   analogSetPinAttenuation(
@@ -841,161 +680,85 @@ void setup() {
   );
 
 
-  // ===================================================
-  // CALIBRATION
-  // ===================================================
+  // =========================
+  // WIFI
+  // =========================
+  connectWiFi();
+
+
+  // =========================
+  // ACS712 CALIBRATION
+  // =========================
+  calibrateCurrentSensor();
+
+
+  // =========================
+  // INITIALIZE TIMERS
+  // =========================
+  lastEnergyTime =
+    millis();
+
+  // Make first purchase request happen immediately
+  lastPurchaseCheck =
+    millis() - PURCHASE_INTERVAL;
+
+  // Make first metrics POST happen immediately
+  lastMetricsSend =
+    millis() - METRICS_INTERVAL;
+
 
   Serial.println();
-  Serial.println("Calibrating zero current...");
-  Serial.println("Make sure NO current is flowing.");
-
-  delay(1000);
-
-  long total = 0;
-
-  const int CALIBRATION_SAMPLES = 1000;
-
-  for (
-    int i = 0;
-    i < CALIBRATION_SAMPLES;
-    i++
-  ) {
-
-    total += analogRead(ACS712_PIN);
-
-    delayMicroseconds(100);
-  }
-
-
-  float averageADC =
-    total / (float)CALIBRATION_SAMPLES;
-
-
-  zeroVoltage =
-    (averageADC / ADC_MAX) * ADC_REFERENCE;
-
-
-  Serial.print("Zero ADC = ");
-  Serial.println(averageADC);
-
-  Serial.print("Zero Voltage = ");
-  Serial.print(zeroVoltage, 4);
-  Serial.println(" V");
-
-  Serial.println("Calibration complete.");
-
-
-  // ===================================================
-  // CREATE MUTEX
-  // ===================================================
-
-  stateMutex =
-    xSemaphoreCreateMutex();
-
-  if (stateMutex == NULL) {
-
-    Serial.println(
-      "ERROR: Failed to create mutex!"
-    );
-
-    while (true) {
-
-      delay(1000);
-    }
-  }
-
-
-  // ===================================================
-  // INITIALIZE SHARED STATE
-  // ===================================================
-
-  latestCurrent = 0.0;
-
-  currentIsOn = false;
-
-  relayTrigger = false;
-
-  relayActive = false;
-
-  producerEnergyKWh = 0.0;
-
-
-  // ===================================================
-  // SENSOR TASK
-  // ===================================================
-
-  xTaskCreatePinnedToCore(
-    sensorTask,
-    "SensorTask",
-    4096,
-    NULL,
-    2,
-    NULL,
-    0
-  );
-
-
-  // ===================================================
-  // RELAY TASK
-  // ===================================================
-
-  xTaskCreatePinnedToCore(
-    relayTask,
-    "RelayTask",
-    4096,
-    NULL,
-    3,
-    NULL,
-    0
-  );
-
-
-  // ===================================================
-  // NETWORK TASK
-  // ===================================================
-
-  xTaskCreatePinnedToCore(
-    networkTask,
-    "NetworkTask",
-    8192,
-    NULL,
-    1,
-    NULL,
-    1
-  );
-
-
-  // ===================================================
-  // READY
-  // ===================================================
-
+  Serial.println("Smart meter ready.");
   Serial.println();
-  Serial.println("ESP32 is ready.");
-  Serial.println("================================");
-  Serial.println("Multithreading enabled:");
-  Serial.println("Sensor  -> Core 0");
-  Serial.println("Relay   -> Core 0");
-  Serial.println("Network -> Core 1");
-  Serial.println("--------------------------------");
-  Serial.println("Producer metrics enabled");
-  Serial.println("Endpoint:");
-  Serial.println(METRICS_URL);
-  Serial.println("--------------------------------");
-  Serial.println("Producer voltage = 5.00 V");
-  Serial.println("Power factor = 0.95");
-  Serial.println("================================");
 }
 
 
 // =====================================================
 // MAIN LOOP
 // =====================================================
-
 void loop() {
 
-  // All work is handled by FreeRTOS tasks.
+  unsigned long now = millis();
 
-  vTaskDelay(
-    pdMS_TO_TICKS(1000)
-  );
+
+  // =========================
+  // READ SENSOR
+  // =========================
+  readCurrent();
+
+
+  // =========================
+  // UPDATE RELAY
+  // =========================
+  updateRelay();
+
+
+  // =========================
+  // CHECK PURCHASE
+  // =========================
+  if (now - lastPurchaseCheck >=
+      PURCHASE_INTERVAL) {
+
+    lastPurchaseCheck = now;
+
+    checkConsumerPurchase();
+  }
+
+
+  // =========================
+  // SEND METRICS
+  // =========================
+  if (now - lastMetricsSend >=
+      METRICS_INTERVAL) {
+
+    lastMetricsSend = now;
+
+    // Sends to BOTH:
+    // /meter-metrics/producer
+    // /meter-metrics/consumer
+    sendMeterMetrics();
+  }
+
+
+  delay(LOOP_DELAY_MS);
 }

@@ -322,6 +322,14 @@
     }catch(e){ window.__buttonOn = false; }
   }
 
+  async function fetchMeterMetrics(){
+    try {
+      const r = await fetch('/meter-metrics/producer');
+      const j = await r.json();
+      window.__meterMetrics = j;
+    } catch(e) { /* ignore */ }
+  }
+
   function syncStateIndicator(){
     if (window.__buttonOn){
       stateDot.className = 'state-dot on';
@@ -338,13 +346,23 @@
     s.aKW = s.la * LOAD_MAX;
     s.bKW = s.lb * LOAD_MAX;
 
-    badgeSolar.textContent = 'Solar '+fmt(s.solarKW)+' kW';
+    const displaySolar = (window.__meterMetrics && window.__meterMetrics.power != null)
+      ? window.__meterMetrics.power / 1000
+      : s.solarKW;
+    badgeSolar.textContent = 'Solar '+fmt(displaySolar)+' kW';
     badgeA.textContent = 'Load '+fmt(s.aKW)+' kW';
     badgeB.textContent = 'Load '+fmt(s.bKW)+' kW';
 
+    // Real producer metrics from the smart meter (kW)
+    const meterKW = (window.__meterMetrics && window.__meterMetrics.power != null)
+      ? window.__meterMetrics.power / 1000
+      : 0;
+
     const houseANet = s.solarKW - s.aKW;
     const totalDemand = s.aKW + s.bKW;
-    const netGrid = s.solarKW - totalDemand;
+    const netGrid = (window.__meterMetrics && window.__meterMetrics.power != null)
+      ? meterKW - totalDemand
+      : s.solarKW - totalDemand;
 
     if (netGrid >= 0.05){
       gridLabel.textContent = 'Exporting to substation';
@@ -465,6 +483,8 @@
 
   fetchButtonState();
   setInterval(fetchButtonState, 1000);
+  fetchMeterMetrics();
+  setInterval(fetchMeterMetrics, 2000);
 
   requestAnimationFrame(animate);
 })();
