@@ -1,0 +1,27 @@
+{
+  "name": "startathon_voltshare_voltmeter",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ByteJoseph/startathon_voltshare_voltmeter.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ByteJoseph/startathon_voltshare_voltmeter/issues"
+  },
+  "homepage": "https://github.com/ByteJoseph/startathon_voltshare_voltmeter#readme",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
