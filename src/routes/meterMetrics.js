@@ -1,22 +1,26 @@
 /**
  * meterMetrics.js — Meter Metrics Routes
  *
- * Endpoints under /meter-metrics:
- *   POST /meter-metrics/producer   – submit a metric snapshot, get it back, then it is discarded
- *   POST /meter-metrics/consumer   – submit a metric snapshot, get it back, then it is discarded
- *   GET  /meter-metrics/producer   – returns all-zero metrics (no persistent storage)
- *   GET  /meter-metrics/consumer   – returns all-zero metrics (no persistent storage)
+ * POST /meter-metrics/producer   — store a metric snapshot in memory (no response body)
+ * GET  /meter-metrics/producer   — retrieve and auto-clear the stored snapshot (or all zeros if none)
+ * POST /meter-metrics/consumer   — store a metric snapshot in memory (no response body)
+ * GET  /meter-metrics/consumer   — retrieve and auto-clear the stored snapshot (or all zeros if none)
  *
- * Design notes:
- *   • POST reads the JSON body, fills in any missing fields with 0, and echoes the result.
- *   • Nothing is persisted between requests — each POST is served once and then forgotten.
- *   • GET always returns zeros because there is no storage; this is the "nothing posted yet" state.
- *   • If you need a one-shot read where a GET consumes a previously posted value, that pattern
- *     is not implemented here and would require a small in-memory store.
+ * Design:
+ *   • POST stores the submitted values in a module-level variable (one slot per meter type).
+ *     It returns 204 No Content — the value is NOT echoed back.
+ *   • GET retrieves the stored value and then clears it (one-shot read). Returns all-zero
+ *     metrics if nothing has been posted yet, or the slot was already consumed.
+ *   • Each slot holds only the most recent POST; a second POST overwrites the previous one.
  */
 
 const express = require('express');
 const router = express.Router();
+
+// In-memory storage for the most recently posted metric snapshot.
+// Each POST overwrites the previous value. GET reads and then clears the slot.
+let producerSnapshot = null;
+let consumerSnapshot = null;
 
 /**
  * Build a producer-side metric object from a submitted payload.
@@ -55,57 +59,47 @@ function buildConsumerMetrics(submitted = {}) {
 /**
  * POST /meter-metrics/producer
  *
- * Accepts a JSON body with optional power/energy/voltage/powerFactor fields.
- * Returns the same metrics (missing fields filled with 0) and then discards them.
- * No data is persisted — a subsequent GET will return all zeros.
+ * Stores the submitted metric snapshot in memory. Returns 204 No Content.
+ * The stored value is delivered on GET /meter-metrics/producer and then auto-removed.
  */
 router.post('/producer', (req, res) => {
-  const metrics = buildProducerMetrics(req.body);
-  res.json(metrics);
+  producerSnapshot = buildProducerMetrics(req.body);
+  res.status(204).end();
 });
 
 /**
  * POST /meter-metrics/consumer
  *
- * Accepts a JSON body with optional power/energy/voltage/powerFactor fields.
- * Returns the same metrics (missing fields filled with 0) and then discards them.
- * No data is persisted — a subsequent GET will return all zeros.
+ * Stores the submitted metric snapshot in memory. Returns 204 No Content.
+ * The stored value is delivered on GET /meter-metrics/consumer and then auto-removed.
  */
 router.post('/consumer', (req, res) => {
-  const metrics = buildConsumerMetrics(req.body);
-  res.json(metrics);
+  consumerSnapshot = buildConsumerMetrics(req.body);
+  res.status(204).end();
 });
 
 /**
  * GET /meter-metrics/producer
  *
- * Returns all-zero metrics. There is no persistent storage, so this is the
- * "nothing has been posted" / "last post was already served and discarded" state.
+ * Retrieves the stored producer snapshot and then auto-clears it (one-shot read).
+ * Returns all-zero metrics if nothing has been posted yet or the slot was already consumed.
  */
 router.get('/producer', (req, res) => {
-  res.json({
-    power: 0,
-    energy: 0,
-    voltage: 0,
-    powerFactor: 0,
-    meter: 'producer'
-  });
+  const snapshot = producerSnapshot;
+  producerSnapshot = null; // auto-remove after serving
+  res.json(snapshot || buildProducerMetrics());
 });
 
 /**
  * GET /meter-metrics/consumer
  *
- * Returns all-zero metrics. There is no persistent storage, so this is the
- * "nothing has been posted" / "last post was already served and discarded" state.
+ * Retrieves the stored consumer snapshot and then auto-clears it (one-shot read).
+ * Returns all-zero metrics if nothing has been posted yet or the slot was already consumed.
  */
 router.get('/consumer', (req, res) => {
-  res.json({
-    power: 0,
-    energy: 0,
-    voltage: 0,
-    powerFactor: 0,
-    meter: 'consumer'
-  });
+  const snapshot = consumerSnapshot;
+  consumerSnapshot = null; // auto-remove after serving
+  res.json(snapshot || buildConsumerMetrics());
 });
 
 module.exports = router;

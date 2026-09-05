@@ -116,13 +116,17 @@ Generates simulated consumer-side (load) meter data.
 
 ## Meter Metrics
 
-Endpoints for submitting and reading meter metric snapshots. Metrics are **not persisted** — a POST value is served once and then discarded, and a GET returns all zeros unless a POST has just been served (which does not persist).
+Endpoints for submitting and reading meter metric snapshots using a **one-shot store-and-read pattern**:
+
+- **POST** stores a metric snapshot in memory and returns `204 No Content` (the value is not echoed).
+- **GET** retrieves the stored snapshot and then **auto-clears it**. If nothing was posted, or the slot was already consumed, GET returns all-zero metrics.
+- Each meter type (producer / consumer) has its own slot. A new POST overwrites the previous one.
 
 ---
 
 ### `POST /meter-metrics/producer`
 
-Submit a producer-side (generation) metric snapshot. The submitted values are echoed back and then discarded. Missing fields default to `0`.
+Store a producer-side (generation) metric snapshot in memory. Returns `204 No Content`. The stored value is delivered on the next `GET /meter-metrics/producer` and then removed.
 
 **Request Body (all fields optional):**
 
@@ -142,23 +146,15 @@ Submit a producer-side (generation) metric snapshot. The submitted values are ec
 | `voltage`    | number | No       | 0       | Volts                    |
 | `powerFactor`| number | No       | 0       | Power factor (0–1)       |
 
-**Success Response (200):**
+**Success Response (204):**
 
-```json
-{
-  "power": 3000.00,
-  "energy": 200.00,
-  "voltage": 250.00,
-  "powerFactor": 0.95,
-  "meter": "producer"
-}
-```
+No content.
 
 ---
 
 ### `POST /meter-metrics/consumer`
 
-Submit a consumer-side (load) metric snapshot. The submitted values are echoed back and then discarded. Missing fields default to `0`.
+Store a consumer-side (load) metric snapshot in memory. Returns `204 No Content`. The stored value is delivered on the next `GET /meter-metrics/consumer` and then removed.
 
 **Request Body (all fields optional):**
 
@@ -178,25 +174,29 @@ Submit a consumer-side (load) metric snapshot. The submitted values are echoed b
 | `voltage`    | number | No       | 0       | Volts                    |
 | `powerFactor`| number | No       | 0       | Power factor (0–1)       |
 
-**Success Response (200):**
+**Success Response (204):**
 
-```json
-{
-  "power": 1500.00,
-  "energy": 100.00,
-  "voltage": 240.00,
-  "powerFactor": 0.80,
-  "meter": "consumer"
-}
-```
+No content.
 
 ---
 
 ### `GET /meter-metrics/producer`
 
-Returns all-zero producer metrics. There is no persistent storage, so this represents the "nothing posted yet" or "last post was already served and discarded" state.
+Retrieve the stored producer snapshot and auto-clear it. Returns the posted metrics if available, otherwise all zeros.
 
-**Response:**
+**Response (200) — if a snapshot was posted:**
+
+```json
+{
+  "power": 3000.00,
+  "energy": 200.00,
+  "voltage": 250.00,
+  "powerFactor": 0.95,
+  "meter": "producer"
+}
+```
+
+**Response (200) — if nothing was posted (or already consumed):**
 
 ```json
 {
@@ -212,9 +212,21 @@ Returns all-zero producer metrics. There is no persistent storage, so this repre
 
 ### `GET /meter-metrics/consumer`
 
-Returns all-zero consumer metrics. There is no persistent storage, so this represents the "nothing posted yet" or "last post was already served and discarded" state.
+Retrieve the stored consumer snapshot and auto-clear it. Returns the posted metrics if available, otherwise all zeros.
 
-**Response:**
+**Response (200) — if a snapshot was posted:**
+
+```json
+{
+  "power": 1500.00,
+  "energy": 100.00,
+  "voltage": 240.00,
+  "powerFactor": 0.80,
+  "meter": "consumer"
+}
+```
+
+**Response (200) — if nothing was posted (or already consumed):**
 
 ```json
 {
