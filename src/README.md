@@ -116,11 +116,33 @@ Generates simulated consumer-side (load) meter data.
 
 ## Meter Metrics
 
-### `GET /meter-metrics/producer`
+Endpoints for submitting and reading meter metric snapshots. Metrics are **not persisted** — a POST value is served once and then discarded, and a GET returns all zeros unless a POST has just been served (which does not persist).
 
-Generates random producer-side metrics (generation).
+---
 
-**Response:**
+### `POST /meter-metrics/producer`
+
+Submit a producer-side (generation) metric snapshot. The submitted values are echoed back and then discarded. Missing fields default to `0`.
+
+**Request Body (all fields optional):**
+
+```json
+{
+  "power": 3000.00,
+  "energy": 200.00,
+  "voltage": 250.00,
+  "powerFactor": 0.95
+}
+```
+
+| Field        | Type   | Required | Default | Description              |
+|--------------|--------|----------|---------|--------------------------|
+| `power`      | number | No       | 0       | Watts generated          |
+| `energy`     | number | No       | 0       | kWh exported             |
+| `voltage`    | number | No       | 0       | Volts                    |
+| `powerFactor`| number | No       | 0       | Power factor (0–1)       |
+
+**Success Response (200):**
 
 ```json
 {
@@ -132,11 +154,31 @@ Generates random producer-side metrics (generation).
 }
 ```
 
-### `GET /meter-metrics/consumer`
+---
 
-Generates random consumer-side metrics (load).
+### `POST /meter-metrics/consumer`
 
-**Response:**
+Submit a consumer-side (load) metric snapshot. The submitted values are echoed back and then discarded. Missing fields default to `0`.
+
+**Request Body (all fields optional):**
+
+```json
+{
+  "power": 1500.00,
+  "energy": 100.00,
+  "voltage": 240.00,
+  "powerFactor": 0.80
+}
+```
+
+| Field        | Type   | Required | Default | Description              |
+|--------------|--------|----------|---------|--------------------------|
+| `power`      | number | No       | 0       | Watts consumed           |
+| `energy`     | number | No       | 0       | kWh imported             |
+| `voltage`    | number | No       | 0       | Volts                    |
+| `powerFactor`| number | No       | 0       | Power factor (0–1)       |
+
+**Success Response (200):**
 
 ```json
 {
@@ -144,6 +186,42 @@ Generates random consumer-side metrics (load).
   "energy": 100.00,
   "voltage": 240.00,
   "powerFactor": 0.80,
+  "meter": "consumer"
+}
+```
+
+---
+
+### `GET /meter-metrics/producer`
+
+Returns all-zero producer metrics. There is no persistent storage, so this represents the "nothing posted yet" or "last post was already served and discarded" state.
+
+**Response:**
+
+```json
+{
+  "power": 0,
+  "energy": 0,
+  "voltage": 0,
+  "powerFactor": 0,
+  "meter": "producer"
+}
+```
+
+---
+
+### `GET /meter-metrics/consumer`
+
+Returns all-zero consumer metrics. There is no persistent storage, so this represents the "nothing posted yet" or "last post was already served and discarded" state.
+
+**Response:**
+
+```json
+{
+  "power": 0,
+  "energy": 0,
+  "voltage": 0,
+  "powerFactor": 0,
   "meter": "consumer"
 }
 ```
