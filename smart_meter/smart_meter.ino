@@ -19,9 +19,6 @@
 const char* WIFI_SSID = "Oppo";
 const char* WIFI_PASSWORD = "7356125156";
 
-const char* SERVER_URL =
-  "https://startathon-voltshare-smartmeter.onrender.com";
-
 const char* PURCHASE_URL =
   "https://startathon-voltshare-smartmeter.onrender.com/consumer-purchase";
 
@@ -37,23 +34,23 @@ const float CURRENT_NOISE_THRESHOLD = 0.10;
 
 
 // =====================================================
-// SPEED / TIMING CONFIGURATION
+// TIMING CONFIGURATION
 // =====================================================
 
-// Number of ADC samples per measurement
 const int ADC_SAMPLES = 200;
-
-// Delay between ADC samples
 const int ADC_SAMPLE_DELAY_US = 100;
 
-// Check server for purchase every 1 second
 const unsigned long PURCHASE_INTERVAL = 1000;
-
-// Send ON/OFF status at most every 2 seconds
-const unsigned long STATUS_INTERVAL = 2000;
-
-// Relay ON duration
 const unsigned long RELAY_DURATION = 2000;
+
+
+// =====================================================
+// TASK CONFIGURATION
+// =====================================================
+
+const int SENSOR_TASK_DELAY_MS = 50;
+const int NETWORK_TASK_DELAY_MS = 20;
+const int RELAY_TASK_DELAY_MS = 10;
 
 
 // =====================================================
@@ -62,20 +59,31 @@ const unsigned long RELAY_DURATION = 2000;
 
 float zeroVoltage = 0.0;
 
-String response;
 
-// Timers
-unsigned long lastPurchaseCheck = 0;
-unsigned long lastStatusSend = 0;
-unsigned long relayStartTime = 0;
+// =====================================================
+// SHARED STATE
+// =====================================================
 
-// Relay state
+bool currentIsOn = false;
+
+bool relayTrigger = false;
 bool relayActive = false;
 
-// Current state
-bool currentIsOn = false;
-bool lastSentState = false;
-bool firstStatusSend = true;
+unsigned long relayStartTime = 0;
+
+
+// =====================================================
+// MUTEX
+// =====================================================
+
+SemaphoreHandle_t stateMutex;
+
+
+// =====================================================
+// TIMER
+// =====================================================
+
+unsigned long lastPurchaseCheck = 0;
 
 
 // =====================================================
@@ -97,7 +105,8 @@ void connectWiFi() {
 
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
 
-    delay(250);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
     Serial.print(".");
 
     attempts++;
@@ -147,124 +156,19 @@ bool ensureWiFi() {
   while (WiFi.status() != WL_CONNECTED &&
          millis() - startTime < 5000) {
 
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 
   if (WiFi.status() == WL_CONNECTED) {
 
     Serial.println("WiFi reconnected!");
+
     return true;
   }
 
   Serial.println("WiFi reconnect failed.");
 
   return false;
-}
-
-
-// =====================================================
-// HTTP GET
-// =====================================================
-
-String httpGET(const String& url) {
-
-  if (!ensureWiFi()) {
-    return "";
-  }
-
-  WiFiClientSecure client;
-
-  // Skip certificate verification
-  // Good for testing, but not recommended for production.
-  client.setInsecure();
-
-  HTTPClient http;
-
-  Serial.print("GET: ");
-  Serial.println(url);
-
-  if (!http.begin(client, url)) {
-
-    Serial.println("HTTP begin failed.");
-    return "";
-  }
-
-  // Shorter timeout so ESP32 doesn't get stuck for 10 seconds
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
-
-  int httpCode = http.GET();
-
-  if (httpCode > 0) {
-
-    Serial.print("HTTP code: ");
-    Serial.println(httpCode);
-
-    String result = http.getString();
-
-    http.end();
-
-    return result;
-  }
-
-  Serial.print("HTTP GET failed: ");
-  Serial.println(http.errorToString(httpCode));
-
-  http.end();
-
-  return "";
-}
-
-
-// =====================================================
-// SEND ON/OFF STATUS
-// =====================================================
-
-void sendStatus(bool isOn) {
-
-  if (!ensureWiFi()) {
-    return;
-  }
-
-  String url;
-
-  if (isOn) {
-
-    url = String(SERVER_URL) + "?on=true";
-
-    Serial.println();
-    Serial.println("Sending ON status...");
-
-  } else {
-
-    url = String(SERVER_URL) + "?off=true";
-
-    Serial.println();
-    Serial.println("Sending OFF status...");
-  }
-
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-
-  if (!http.begin(client, url)) {
-
-    Serial.println("Failed to start status request.");
-    return;
-  }
-
-  http.setConnectTimeout(3000);
-  http.setTimeout(3000);
-
-  int httpCode = http.GET();
-
-  Serial.print("Status HTTP code: ");
-  Serial.println(httpCode);
-
-  // We don't actually need the response body here.
-  // Just close the connection.
-  http.end();
 }
 
 
@@ -282,6 +186,7 @@ void checkConsumerPurchase() {
   Serial.println("Checking consumer purchase...");
 
   WiFiClientSecure client;
+
   client.setInsecure();
 
   HTTPClient http;
@@ -289,6 +194,7 @@ void checkConsumerPurchase() {
   if (!http.begin(client, PURCHASE_URL)) {
 
     Serial.println("Failed to start purchase request.");
+
     return;
   }
 
@@ -380,39 +286,20 @@ void checkConsumerPurchase() {
 
 
   // ===================================================
-  // ACTIVATE RELAY
+  // REQUEST RELAY
   // ===================================================
 
   Serial.println("================================");
   Serial.println("PURCHASE DETECTED!");
-  Serial.println("Relay ON");
+  Serial.println("Requesting Relay ON");
   Serial.println("================================");
 
-  digitalWrite(RELAY_PIN, HIGH);
 
-  relayActive = true;
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
 
-  relayStartTime = millis();
-}
+    relayTrigger = true;
 
-
-// =====================================================
-// HANDLE RELAY TIMER
-// =====================================================
-
-void handleRelay() {
-
-  if (!relayActive) {
-    return;
-  }
-
-  if (millis() - relayStartTime >= RELAY_DURATION) {
-
-    digitalWrite(RELAY_PIN, LOW);
-
-    relayActive = false;
-
-    Serial.println("Relay OFF");
+    xSemaphoreGive(stateMutex);
   }
 }
 
@@ -431,6 +318,7 @@ float readCurrent() {
 
     delayMicroseconds(ADC_SAMPLE_DELAY_US);
   }
+
 
   float averageADC =
     total / (float)ADC_SAMPLES;
@@ -452,7 +340,7 @@ float readCurrent() {
   }
 
 
-  // Your original code reverses the sign
+  // Original sign reversal
   current = -current;
 
 
@@ -474,6 +362,179 @@ float readCurrent() {
 
 
   return current;
+}
+
+
+// =====================================================
+// SENSOR TASK
+// =====================================================
+
+void sensorTask(void* parameter) {
+
+  Serial.println("Sensor task started.");
+
+  while (true) {
+
+    float current = readCurrent();
+
+    bool newCurrentState =
+      fabs(current) >= CURRENT_NOISE_THRESHOLD;
+
+
+    // Save current state
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+      currentIsOn = newCurrentState;
+
+      xSemaphoreGive(stateMutex);
+    }
+
+
+    if (newCurrentState) {
+
+      Serial.println("CURRENT: ON");
+
+    } else {
+
+      Serial.println("CURRENT: OFF");
+    }
+
+
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_TASK_DELAY_MS));
+  }
+}
+
+
+// =====================================================
+// RELAY TASK
+// =====================================================
+
+void relayTask(void* parameter) {
+
+  Serial.println("Relay task started.");
+
+  while (true) {
+
+    bool shouldTrigger = false;
+
+
+    // =================================================
+    // CHECK FOR RELAY REQUEST
+    // =================================================
+
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+      if (relayTrigger) {
+
+        relayTrigger = false;
+
+        shouldTrigger = true;
+      }
+
+      xSemaphoreGive(stateMutex);
+    }
+
+
+    // =================================================
+    // TURN RELAY ON
+    // =================================================
+
+    if (shouldTrigger) {
+
+      digitalWrite(RELAY_PIN, HIGH);
+
+      Serial.println("Relay ON");
+
+
+      if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+        relayActive = true;
+
+        relayStartTime = millis();
+
+        xSemaphoreGive(stateMutex);
+      }
+    }
+
+
+    // =================================================
+    // CHECK RELAY TIMER
+    // =================================================
+
+    bool shouldTurnOff = false;
+
+
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+      if (relayActive &&
+          millis() - relayStartTime >= RELAY_DURATION) {
+
+        relayActive = false;
+
+        shouldTurnOff = true;
+      }
+
+      xSemaphoreGive(stateMutex);
+    }
+
+
+    // =================================================
+    // TURN RELAY OFF
+    // =================================================
+
+    if (shouldTurnOff) {
+
+      digitalWrite(RELAY_PIN, LOW);
+
+      Serial.println("Relay OFF");
+    }
+
+
+    vTaskDelay(pdMS_TO_TICKS(RELAY_TASK_DELAY_MS));
+  }
+}
+
+
+// =====================================================
+// NETWORK TASK
+// =====================================================
+//
+// ONLY checks consumer purchases.
+// NO ON/OFF status is sent to the server.
+//
+
+void networkTask(void* parameter) {
+
+  Serial.println("Network task started.");
+
+  // Allow immediate first purchase check
+  lastPurchaseCheck =
+    millis() - PURCHASE_INTERVAL;
+
+
+  while (true) {
+
+    unsigned long now = millis();
+
+
+    // =================================================
+    // CHECK PURCHASE
+    // =================================================
+
+    if (now - lastPurchaseCheck >= PURCHASE_INTERVAL) {
+
+      lastPurchaseCheck = now;
+
+      checkConsumerPurchase();
+    }
+
+
+    // =================================================
+    // GIVE CPU TO OTHER TASKS
+    // =================================================
+
+    vTaskDelay(pdMS_TO_TICKS(NETWORK_TASK_DELAY_MS));
+  }
 }
 
 
@@ -553,16 +614,79 @@ void setup() {
   Serial.println("Calibration complete.");
 
 
+  // ===================================================
+  // CREATE MUTEX
+  // ===================================================
+
+  stateMutex = xSemaphoreCreateMutex();
+
+  if (stateMutex == NULL) {
+
+    Serial.println("ERROR: Failed to create mutex!");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+
+  // ===================================================
+  // SENSOR TASK
+  // ===================================================
+
+  xTaskCreatePinnedToCore(
+    sensorTask,
+    "SensorTask",
+    4096,
+    NULL,
+    2,
+    NULL,
+    0
+  );
+
+
+  // ===================================================
+  // RELAY TASK
+  // ===================================================
+
+  xTaskCreatePinnedToCore(
+    relayTask,
+    "RelayTask",
+    4096,
+    NULL,
+    3,
+    NULL,
+    0
+  );
+
+
+  // ===================================================
+  // NETWORK TASK
+  // ===================================================
+
+  xTaskCreatePinnedToCore(
+    networkTask,
+    "NetworkTask",
+    8192,
+    NULL,
+    1,
+    NULL,
+    1
+  );
+
+
+  // ===================================================
+  // READY
+  // ===================================================
+
   Serial.println();
   Serial.println("ESP32 is ready.");
   Serial.println("================================");
-
-
-  // Allow immediate purchase check
-  lastPurchaseCheck = millis() - PURCHASE_INTERVAL;
-
-  // Allow immediate status update
-  lastStatusSend = millis() - STATUS_INTERVAL;
+  Serial.println("Multithreading enabled:");
+  Serial.println("Sensor  -> Core 0");
+  Serial.println("Relay   -> Core 0");
+  Serial.println("Network -> Core 1");
+  Serial.println("================================");
 }
 
 
@@ -572,82 +696,7 @@ void setup() {
 
 void loop() {
 
-  unsigned long now = millis();
+  // All work is handled by FreeRTOS tasks.
 
-
-  // ===================================================
-  // 1. HANDLE RELAY WITHOUT BLOCKING
-  // ===================================================
-
-  handleRelay();
-
-
-  // ===================================================
-  // 2. CHECK CONSUMER PURCHASE EVERY 1 SECOND
-  // ===================================================
-
-  if (now - lastPurchaseCheck >= PURCHASE_INTERVAL) {
-
-    lastPurchaseCheck = now;
-
-    checkConsumerPurchase();
-  }
-
-
-  // ===================================================
-  // 3. MEASURE CURRENT
-  // ===================================================
-
-  float current = readCurrent();
-
-
-  // ===================================================
-  // 4. DETERMINE ON/OFF STATE
-  // ===================================================
-
-  bool newCurrentState =
-    fabs(current) >= CURRENT_NOISE_THRESHOLD;
-
-
-  if (newCurrentState) {
-
-    Serial.println("STATUS: ON");
-
-  } else {
-
-    Serial.println("STATUS: OFF");
-  }
-
-
-  // ===================================================
-  // 5. SEND STATUS ONLY WHEN NECESSARY
-  // ===================================================
-
-  bool stateChanged =
-    newCurrentState != lastSentState;
-
-
-  bool periodicUpdate =
-    now - lastStatusSend >= STATUS_INTERVAL;
-
-
-  if (firstStatusSend ||
-      stateChanged ||
-      periodicUpdate) {
-
-    sendStatus(newCurrentState);
-
-    lastSentState = newCurrentState;
-
-    lastStatusSend = millis();
-
-    firstStatusSend = false;
-  }
-
-
-  // ===================================================
-  // VERY SMALL DELAY
-  // ===================================================
-
-  delay(5);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
