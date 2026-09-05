@@ -1,32 +1,92 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+// =====================================================
+// PIN CONFIGURATION
+// =====================================================
 
 #define ACS712_PIN 34
 #define RELAY_PIN 32
 
-// ===============================
-// Wi-Fi credentials
-// ===============================
+
+// =====================================================
+// WIFI / SERVER CONFIGURATION
+// =====================================================
+
 const char* WIFI_SSID = "Oppo";
 const char* WIFI_PASSWORD = "7356125156";
-const char* SERVER_URL = "https://startathon-voltshare-smartmeter.onrender.com";
+
+const char* SERVER_URL =
+  "https://startathon-voltshare-smartmeter.onrender.com";
+
+const char* PURCHASE_URL =
+  "https://startathon-voltshare-smartmeter.onrender.com/consumer-purchase";
+
+
+// =====================================================
+// ACS712 CONFIGURATION
+// =====================================================
 
 const float SENSITIVITY = 0.185;
 const float ADC_REFERENCE = 3.3;
 const float ADC_MAX = 4095.0;
 const float CURRENT_NOISE_THRESHOLD = 0.10;
 
+
+// =====================================================
+// SPEED / TIMING CONFIGURATION
+// =====================================================
+
+// Number of ADC samples per measurement
+const int ADC_SAMPLES = 200;
+
+// Delay between ADC samples
+const int ADC_SAMPLE_DELAY_US = 100;
+
+// Check server for purchase every 1 second
+const unsigned long PURCHASE_INTERVAL = 1000;
+
+// Send ON/OFF status at most every 2 seconds
+const unsigned long STATUS_INTERVAL = 2000;
+
+// Relay ON duration
+const unsigned long RELAY_DURATION = 2000;
+
+
+// =====================================================
+// GLOBAL VARIABLES
+// =====================================================
+
 float zeroVoltage = 0.0;
+
 String response;
+
+// Timers
+unsigned long lastPurchaseCheck = 0;
+unsigned long lastStatusSend = 0;
+unsigned long relayStartTime = 0;
+
+// Relay state
+bool relayActive = false;
+
+// Current state
+bool currentIsOn = false;
+bool lastSentState = false;
+bool firstStatusSend = true;
+
+
+// =====================================================
+// WIFI CONNECTION
+// =====================================================
 
 void connectWiFi() {
 
   Serial.println();
   Serial.println("==============================");
   Serial.println("Starting WiFi connection...");
-  Serial.print("WiFi name: ");
-  Serial.println(WIFI_SSID);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -37,7 +97,7 @@ void connectWiFi() {
 
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
 
-    delay(500);
+    delay(250);
     Serial.print(".");
 
     attempts++;
@@ -48,8 +108,10 @@ void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
 
     Serial.println("WiFi connected!");
+
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+
     Serial.print("Signal strength: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
@@ -57,58 +119,88 @@ void connectWiFi() {
   } else {
 
     Serial.println("WiFi connection FAILED!");
-    Serial.println("Check WiFi name and password.");
   }
 
   Serial.println("==============================");
 }
 
+
+// =====================================================
+// ENSURE WIFI CONNECTION
+// =====================================================
+
+bool ensureWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  Serial.println();
+  Serial.println("WiFi disconnected.");
+  Serial.println("Reconnecting...");
+
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startTime < 5000) {
+
+    delay(100);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println("WiFi reconnected!");
+    return true;
+  }
+
+  Serial.println("WiFi reconnect failed.");
+
+  return false;
+}
+
+
+// =====================================================
+// HTTP GET
+// =====================================================
+
 String httpGET(const String& url) {
 
-  // Check WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-
-    Serial.println("WiFi disconnected.");
-    Serial.println("Trying to reconnect...");
-
-    connectWiFi();
-
-    if (WiFi.status() != WL_CONNECTED) {
-
-      Serial.println("Could not reconnect to WiFi.");
-      return "";
-    }
+  if (!ensureWiFi()) {
+    return "";
   }
 
   WiFiClientSecure client;
+
+  // Skip certificate verification
+  // Good for testing, but not recommended for production.
   client.setInsecure();
 
   HTTPClient http;
 
-  Serial.print("Sending request: ");
+  Serial.print("GET: ");
   Serial.println(url);
 
-  // HTTPS connection
   if (!http.begin(client, url)) {
 
     Serial.println("HTTP begin failed.");
     return "";
   }
 
-  http.setConnectTimeout(10000);
-  http.setTimeout(10000);
+  // Shorter timeout so ESP32 doesn't get stuck for 10 seconds
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
 
   int httpCode = http.GET();
 
   if (httpCode > 0) {
 
-    Serial.print("HTTP Response Code: ");
+    Serial.print("HTTP code: ");
     Serial.println(httpCode);
 
     String result = http.getString();
-
-    Serial.print("Server response: ");
-    Serial.println(result);
 
     http.end();
 
@@ -123,90 +215,236 @@ String httpGET(const String& url) {
   return "";
 }
 
-void setup() {
-  // Back to standard output mode
-  Serial.begin(115200);
 
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+// =====================================================
+// SEND ON/OFF STATUS
+// =====================================================
 
-  delay(1000);
+void sendStatus(bool isOn) {
 
-  connectWiFi();
-
-  analogReadResolution(12);
-
-  analogSetPinAttenuation(
-    ACS712_PIN,
-    ADC_11db
-  );
-
-  Serial.println();
-  Serial.println("Calibrating zero current...");
-  Serial.println("Make sure NO current is flowing.");
-
-  delay(2000);
-
-  long total = 0;
-
-  for (int i = 0; i < 2000; i++) {
-
-    total += analogRead(ACS712_PIN);
-
-    delay(1);
+  if (!ensureWiFi()) {
+    return;
   }
 
-  float averageADC =
-    total / 2000.0;
+  String url;
 
-  zeroVoltage =
-    (averageADC / ADC_MAX) * ADC_REFERENCE;
+  if (isOn) {
 
-  Serial.print("Zero ADC = ");
-  Serial.println(averageADC);
+    url = String(SERVER_URL) + "?on=true";
 
-  Serial.print("Zero Voltage = ");
-  Serial.print(zeroVoltage, 4);
-  Serial.println(" V");
+    Serial.println();
+    Serial.println("Sending ON status...");
 
-  Serial.println("Calibration complete.");
+  } else {
 
-  Serial.println();
-  Serial.println("ESP32 is ready.");
-  Serial.println("================================");
+    url = String(SERVER_URL) + "?off=true";
+
+    Serial.println();
+    Serial.println("Sending OFF status...");
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (!http.begin(client, url)) {
+
+    Serial.println("Failed to start status request.");
+    return;
+  }
+
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
+  int httpCode = http.GET();
+
+  Serial.print("Status HTTP code: ");
+  Serial.println(httpCode);
+
+  // We don't actually need the response body here.
+  // Just close the connection.
+  http.end();
 }
 
-void loop() {
-  // // Transistor ON -> Relay ON -> LED turns ON, Motor turns OFF
-  // digitalWrite(RELAY_PIN, HIGH);
-  // delay(1000);
 
-  // // Transistor OFF -> Relay OFF -> Motor turns ON, LED turns OFF
-  // digitalWrite(RELAY_PIN, LOW);
-  // delay(1000);
+// =====================================================
+// CHECK CONSUMER PURCHASE
+// =====================================================
+
+void checkConsumerPurchase() {
+
+  if (!ensureWiFi()) {
+    return;
+  }
+
+  Serial.println();
+  Serial.println("Checking consumer purchase...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  if (!http.begin(client, PURCHASE_URL)) {
+
+    Serial.println("Failed to start purchase request.");
+    return;
+  }
+
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
+  int httpCode = http.GET();
+
+  Serial.print("Purchase response code: ");
+  Serial.println(httpCode);
+
+
+  // ===================================================
+  // NO PURCHASE
+  // ===================================================
+
+  if (httpCode == 404) {
+
+    Serial.println("No consumer purchase found.");
+
+    http.end();
+
+    return;
+  }
+
+
+  // ===================================================
+  // SERVER ERROR
+  // ===================================================
+
+  if (httpCode <= 0) {
+
+    Serial.print("Purchase request failed: ");
+    Serial.println(http.errorToString(httpCode));
+
+    http.end();
+
+    return;
+  }
+
+
+  // ===================================================
+  // GET JSON
+  // ===================================================
+
+  String jsonResponse = http.getString();
+
+  http.end();
+
+  Serial.print("Purchase JSON: ");
+  Serial.println(jsonResponse);
+
+
+  // ===================================================
+  // PARSE JSON
+  // ===================================================
+
+  JsonDocument doc;
+
+  DeserializationError error =
+    deserializeJson(doc, jsonResponse);
+
+  if (error) {
+
+    Serial.print("JSON parsing failed: ");
+    Serial.println(error.c_str());
+
+    return;
+  }
+
+
+  // ===================================================
+  // GET KWH
+  // ===================================================
+
+  if (!doc["kwh"].is<float>() &&
+      !doc["kwh"].is<int>() &&
+      !doc["kwh"].is<double>()) {
+
+    Serial.println("JSON does not contain valid kwh.");
+
+    return;
+  }
+
+  float kwh = doc["kwh"].as<float>();
+
+  Serial.print("KWH received: ");
+  Serial.println(kwh, 4);
+
+
+  // ===================================================
+  // ACTIVATE RELAY
+  // ===================================================
+
+  Serial.println("================================");
+  Serial.println("PURCHASE DETECTED!");
+  Serial.println("Relay ON");
+  Serial.println("================================");
+
+  digitalWrite(RELAY_PIN, HIGH);
+
+  relayActive = true;
+
+  relayStartTime = millis();
+}
+
+
+// =====================================================
+// HANDLE RELAY TIMER
+// =====================================================
+
+void handleRelay() {
+
+  if (!relayActive) {
+    return;
+  }
+
+  if (millis() - relayStartTime >= RELAY_DURATION) {
+
+    digitalWrite(RELAY_PIN, LOW);
+
+    relayActive = false;
+
+    Serial.println("Relay OFF");
+  }
+}
+
+
+// =====================================================
+// READ CURRENT
+// =====================================================
+
+float readCurrent() {
 
   long total = 0;
 
-  for (int i = 0; i < 1000; i++) {
+  for (int i = 0; i < ADC_SAMPLES; i++) {
 
     total += analogRead(ACS712_PIN);
 
-    delayMicroseconds(100);
+    delayMicroseconds(ADC_SAMPLE_DELAY_US);
   }
 
   float averageADC =
-    total / 1000.0;
+    total / (float)ADC_SAMPLES;
+
 
   float voltage =
     (averageADC / ADC_MAX) * ADC_REFERENCE;
+
 
   float current =
     (voltage - zeroVoltage) / SENSITIVITY;
 
 
-  // -------------------------------
-  // Remove small noise
-  // -------------------------------
+  // Remove noise
   if (current > -CURRENT_NOISE_THRESHOLD &&
       current < CURRENT_NOISE_THRESHOLD) {
 
@@ -214,11 +452,9 @@ void loop() {
   }
 
 
-  // -------------------------------
-  // Display current
-  // -------------------------------
-  float displayCurrent = -1 * current;
-  current = displayCurrent;
+  // Your original code reverses the sign
+  current = -current;
+
 
   Serial.println();
   Serial.println("------------------------------");
@@ -231,36 +467,187 @@ void loop() {
   Serial.println(" V");
 
   Serial.print("Current = ");
-  Serial.print(displayCurrent, 3);
+  Serial.print(current, 3);
   Serial.println(" A");
-
-
-  // -------------------------------
-  // Send ON/OFF status
-  // -------------------------------
-  if (fabs(current) < CURRENT_NOISE_THRESHOLD) {
-
-    current = 0;
-
-    Serial.println("STATUS: OFF");
-    Serial.println("Sending OFF request...");
-
-    response = httpGET(
-      String(SERVER_URL) + "?off=true"
-    );
-
-  } else {
-
-    Serial.println("STATUS: ON");
-    Serial.println("Sending ON request...");
-
-    response = httpGET(
-      String(SERVER_URL) + "?on=true"
-    );
-  }
-
 
   Serial.println("------------------------------");
 
-  delay(50);
+
+  return current;
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, LOW);
+
+  delay(500);
+
+
+  // ===================================================
+  // WIFI
+  // ===================================================
+
+  connectWiFi();
+
+
+  // ===================================================
+  // ADC CONFIGURATION
+  // ===================================================
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(
+    ACS712_PIN,
+    ADC_11db
+  );
+
+
+  // ===================================================
+  // CALIBRATION
+  // ===================================================
+
+  Serial.println();
+  Serial.println("Calibrating zero current...");
+  Serial.println("Make sure NO current is flowing.");
+
+  delay(1000);
+
+  long total = 0;
+
+  const int CALIBRATION_SAMPLES = 1000;
+
+  for (int i = 0;
+       i < CALIBRATION_SAMPLES;
+       i++) {
+
+    total += analogRead(ACS712_PIN);
+
+    delayMicroseconds(100);
+  }
+
+
+  float averageADC =
+    total / (float)CALIBRATION_SAMPLES;
+
+
+  zeroVoltage =
+    (averageADC / ADC_MAX) * ADC_REFERENCE;
+
+
+  Serial.print("Zero ADC = ");
+  Serial.println(averageADC);
+
+  Serial.print("Zero Voltage = ");
+  Serial.print(zeroVoltage, 4);
+  Serial.println(" V");
+
+  Serial.println("Calibration complete.");
+
+
+  Serial.println();
+  Serial.println("ESP32 is ready.");
+  Serial.println("================================");
+
+
+  // Allow immediate purchase check
+  lastPurchaseCheck = millis() - PURCHASE_INTERVAL;
+
+  // Allow immediate status update
+  lastStatusSend = millis() - STATUS_INTERVAL;
+}
+
+
+// =====================================================
+// MAIN LOOP
+// =====================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+
+  // ===================================================
+  // 1. HANDLE RELAY WITHOUT BLOCKING
+  // ===================================================
+
+  handleRelay();
+
+
+  // ===================================================
+  // 2. CHECK CONSUMER PURCHASE EVERY 1 SECOND
+  // ===================================================
+
+  if (now - lastPurchaseCheck >= PURCHASE_INTERVAL) {
+
+    lastPurchaseCheck = now;
+
+    checkConsumerPurchase();
+  }
+
+
+  // ===================================================
+  // 3. MEASURE CURRENT
+  // ===================================================
+
+  float current = readCurrent();
+
+
+  // ===================================================
+  // 4. DETERMINE ON/OFF STATE
+  // ===================================================
+
+  bool newCurrentState =
+    fabs(current) >= CURRENT_NOISE_THRESHOLD;
+
+
+  if (newCurrentState) {
+
+    Serial.println("STATUS: ON");
+
+  } else {
+
+    Serial.println("STATUS: OFF");
+  }
+
+
+  // ===================================================
+  // 5. SEND STATUS ONLY WHEN NECESSARY
+  // ===================================================
+
+  bool stateChanged =
+    newCurrentState != lastSentState;
+
+
+  bool periodicUpdate =
+    now - lastStatusSend >= STATUS_INTERVAL;
+
+
+  if (firstStatusSend ||
+      stateChanged ||
+      periodicUpdate) {
+
+    sendStatus(newCurrentState);
+
+    lastSentState = newCurrentState;
+
+    lastStatusSend = millis();
+
+    firstStatusSend = false;
+  }
+
+
+  // ===================================================
+  // VERY SMALL DELAY
+  // ===================================================
+
+  delay(5);
 }
